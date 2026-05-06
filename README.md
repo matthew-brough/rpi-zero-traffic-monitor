@@ -19,7 +19,7 @@ A Raspberry Pi Zero 2 W project that displays real-time traffic and ETA informat
 
 1. Clone the repository:
    ```bash
-   git clone git@github.com:artemOP/rpi-zero-traffic-monitor.git
+   git clone git@github.com:matthew-brough/rpi-zero-traffic-monitor.git
    cd rpi-zero-traffic-monitor
    ```
 
