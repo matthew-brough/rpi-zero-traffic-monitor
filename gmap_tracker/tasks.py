@@ -9,7 +9,7 @@ import time
 from collections.abc import Sequence
 from typing import Any, Callable, Coroutine, Literal, Optional, overload
 
-from _types import MISSING
+from ._types import MISSING
 
 
 class ExponentialBackoff[T: bool | Literal[True] | Literal[False]]:

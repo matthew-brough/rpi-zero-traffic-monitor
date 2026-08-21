@@ -1,44 +1,43 @@
 import asyncio
-import json
 from datetime import datetime, timedelta
 from enum import Enum
-from pathlib import Path
 from types import TracebackType
 from typing import Any, Mapping, Self, Sequence
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from _types.enums import ExtraComputation, RouteTravelMode, RoutingPreference
-from _types.models import LatLng, Location, Request, RouteModifiers, Waypoint
 from adafruit_ssd1305 import SSD1305, SSD1305_128x32, constants
-from tasks import loop
+
+from ._types.enums import RouteTravelMode, RoutingPreference
+from ._types.models import LatLng, Location, Request, RouteModifiers, Waypoint
+from .config import Config, Display
+from .tasks import loop
+
+ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
 
 class Tracker:
     _session: aiohttp.ClientSession
-    _request_body: Request
+    _request_body: Request | None
     _display: SSD1305
-    locations: dict[str, Any]
     headers: dict[str, str]
     task_running: asyncio.Event
 
-    def __init__(self, locations_path: Path, headers_path: Path, offset: timedelta = timedelta()) -> None:
-        self._locations_path = locations_path
-        self._headers_path = headers_path
-        self._offset = offset
+    def __init__(self, config: Config, headers: dict[str, str]) -> None:
+        self.config = config
+        self.headers = headers
+        self.lock = asyncio.Lock()
+        self.last_error: str | None = None
+        self._tz = ZoneInfo(config.timezone)
 
     async def __aenter__(self) -> Self:
         self._session = aiohttp.ClientSession()
         self.task_running = asyncio.Event()
         self._display = SSD1305_128x32().__enter__()
-        self.display.font = self.display.font_folder_path / "small_6x8"
-
-        with open(self._locations_path, "r") as f:
-            self.locations = json.load(f)
-        with open(self._headers_path, "r") as f:
-            self.headers = json.load(f)
+        self._apply_font(self.config.display)
 
         self._build_request_body()
+        self.task.change_interval(minutes=self.config.poll_interval_minutes)
         self.task.start()
         self.task_running.set()
         return self
@@ -56,30 +55,41 @@ class Tracker:
             return True
         return False
 
-    def _build_request_body(self) -> Request:
+    def _apply_font(self, display: Display) -> None:
+        path = SSD1305.available_fonts()[display.font]
+        if path.suffix.lower() in (".ttf", ".otf"):
+            # The font setter reads _font_size, so size has to land first.
+            self._display._font_size = display.font_size
+        self._display.font = path
 
-        def latlng(obj: dict) -> LatLng:
-            return {"latitude": obj["latitude"], "longitude": obj["longitude"]}
+    async def apply_config(self, new: Config) -> None:
+        async with self.lock:
+            if new.display != self.config.display:
+                self._apply_font(new.display)
+            self.config = new
+            self._tz = ZoneInfo(new.timezone)
+            self._build_request_body()
+            self.task.change_interval(minutes=new.poll_interval_minutes)
+            self.task.restart()
 
-        def location(obj: dict) -> Location:
-            return {"latLng": latlng(obj)}
+    def _build_request_body(self) -> Request | None:
+        route = self.config.route
+        if route is None:
+            self._request_body = None
+            return None
 
-        origin: Waypoint = {"location": location(self.locations["origin"])}
-        destination: Waypoint = {"location": location(self.locations["destination"])}
+        def location(point: Any) -> Location:
+            latlng: LatLng = {"latitude": point.latitude, "longitude": point.longitude}
+            return {"latLng": latlng}
 
-        intermediates: list[Waypoint] = []
-        for wp in self.locations.get("intermediates", []):
-            intermediate: Waypoint = {
-                "via": wp.get("via", False),
-                "location": location(wp["location"]),
-            }
-            intermediates.append(intermediate)
+        origin: Waypoint = {"location": location(route.origin)}
+        destination: Waypoint = {"location": location(route.destination)}
+        intermediates: list[Waypoint] = [
+            {"via": wp.via, "location": location(wp.location)} for wp in route.intermediates
+        ]
+        route_modifiers: RouteModifiers = {"avoidTolls": self.config.avoid_tolls}
 
-        route_modifiers: RouteModifiers = {
-            "avoidTolls": True,
-        }
-
-        self._request_body: Request = {
+        self._request_body = {
             "origin": origin,
             "intermediates": intermediates,
             "destination": destination,
@@ -87,8 +97,8 @@ class Tracker:
             "routingPreference": RoutingPreference.TRAFFIC_AWARE,
             "computeAlternativeRoutes": False,
             "routeModifiers": route_modifiers,
-            "languageCode": "en-GB",
-            "units": "IMPERIAL",
+            "languageCode": self.config.language_code,
+            "units": self.config.units,
             "extraComputations": [],
         }
         return self._request_body
@@ -111,19 +121,13 @@ class Tracker:
 
     @property
     def route(self) -> str:
-        return "https://routes.googleapis.com/directions/v2:computeRoutes"
+        return ROUTES_URL
 
     @property
-    def is_daytime(self) -> bool:
-        tz = ZoneInfo("Europe/London")
-        now = datetime.now(tz)
-        return 7 <= now.hour < 16
-
-    @property
-    def is_weekday(self) -> bool:
-        tz = ZoneInfo("Europe/London")
-        now = datetime.now(tz)
-        return now.weekday() < 5  # Monday to Friday are 0-4
+    def is_active(self) -> bool:
+        now = datetime.now(self._tz)
+        schedule = self.config.schedule
+        return now.weekday() in schedule.weekdays and schedule.start <= now.time() < schedule.end
 
     @property
     def display(self) -> SSD1305:
@@ -131,25 +135,31 @@ class Tracker:
 
     @property
     def offset(self) -> timedelta:
-        return self._offset
+        return timedelta(minutes=self.config.eta_offset_minutes)
 
-    @offset.setter
-    def offset(self, value: timedelta) -> None:
-        self._offset = value
+    @property
+    def line_height(self) -> int:
+        height = getattr(self._display.font, "height", self._display.font_size)
+        return min(height + 2, self._display.height // 3)
+
+    async def fetch(self) -> dict[str, Any]:
+        result = await self._session.post(self.route, json=self.stringified_request_body, headers=self.headers)
+        return await result.json()
+
+    def show_lines(self, *lines: str) -> None:
+        self.display.fill(constants.Colour.BLACK)
+        for index, line in enumerate(lines):
+            self.display.text(line, 0, index * self.line_height)
 
     def update_display(self, data: dict[str, Any]) -> None:
-        self.display.fill(constants.Colour.BLACK)
-        travel_seconds_string = data.get("routes", [{}])[0].get("duration", "0").removesuffix("s")
-        travel_seconds = int(travel_seconds_string) + int(self.offset.total_seconds())
-        eta = datetime.now(tz=ZoneInfo("Europe/London")) + timedelta(seconds=travel_seconds)
+        routes = data.get("routes") or [{}]
+        travel_seconds = int(routes[0].get("duration", "0").removesuffix("s")) + int(self.offset.total_seconds())
+        eta = datetime.now(tz=self._tz) + timedelta(seconds=travel_seconds)
 
-        travel_advisory = data.get("routes", [{}])[0].get("travelAdvisory", {}).get("speedReadingIntervals", [])
-        speeds = {}
-        for advisory in travel_advisory:
+        speeds: dict[str, int] = {}
+        for advisory in routes[0].get("travelAdvisory", {}).get("speedReadingIntervals", []):
             speed = advisory.get("speed", "SPEED_UNSPECIFIED")
-            if speed not in speeds:
-                speeds[speed] = 0
-            speeds[speed] += 1
+            speeds[speed] = speeds.get(speed, 0) + 1
 
         if speeds.get("TRAFFIC_JAM", 0) > 0:
             traffic_condition = f"{speeds['TRAFFIC_JAM']}x Jam"
@@ -158,27 +168,29 @@ class Tracker:
         else:
             traffic_condition = "Normal"
 
-        self.display.text(f"ETA:         {eta.strftime('%H:%M')}", 0, 0)
-        self.display.text(f"Travel time: {travel_seconds // 60} min", 0, 10)
-        self.display.text(f"Traffic:     {traffic_condition}", 0, 20)
+        self.show_lines(
+            f"ETA:         {eta.strftime('%H:%M')}",
+            f"Travel time: {travel_seconds // 60} min",
+            f"Traffic:     {traffic_condition}",
+        )
 
     @loop(minutes=3)
     async def task(self) -> None:
-        if not (self.is_weekday and self.is_daytime):
-            self.display.fill(constants.Colour.BLACK)
-            return
+        async with self.lock:
+            if self._request_body is None:
+                return
+            if not self.is_active:
+                self.display.fill(constants.Colour.BLACK)
+                return
 
-        try:
-            result = await self._session.post(
-                self.route,
-                json=self.stringified_request_body,
-                headers=self.headers,
-            )
-            data = await result.json()
-        except Exception as e:
-            print(f"Error during tracking task: {e}")
-        else:
-            self.update_display(data)
+            try:
+                data = await self.fetch()
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                print(f"Error during tracking task: {exc}")
+            else:
+                self.last_error = None
+                self.update_display(data)
 
     @task.before_loop
     async def before_task(self) -> None:
@@ -188,16 +200,7 @@ class Tracker:
     async def after_task(self) -> None:
         self.task_running.clear()
 
-
-async def main():
-    async with Tracker(
-        Path("./gmap_tracker/locations.json"),
-        Path("./gmap_tracker/headers.json"),
-        offset=timedelta(minutes=10),
-    ) as tracker:
-        while tracker.task_running.is_set():
-            await asyncio.sleep(1)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    @task.error
+    async def on_task_error(self, exc: BaseException) -> None:
+        self.last_error = f"{type(exc).__name__}: {exc}"
+        print(f"Tracking loop failed: {exc}")

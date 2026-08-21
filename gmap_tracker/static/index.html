@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Traffic Monitor</title>
+<style>
+  :root { color-scheme: light dark; --gap: 1rem; --edge: #8884; }
+  body { font: 15px/1.45 system-ui, sans-serif; margin: 0 auto; padding: var(--gap); max-width: 46rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; opacity: .65; margin: 1.5rem 0 .5rem; }
+  fieldset { border: 1px solid var(--edge); border-radius: 6px; padding: var(--gap); margin: 0; }
+  label { display: block; margin: .5rem 0; }
+  label > span { display: block; font-size: .8rem; opacity: .7; }
+  input, select, button { font: inherit; padding: .35rem .5rem; }
+  input[type=number], input[type=text], input[type=time], select { width: 100%; box-sizing: border-box; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
+  .row > label { margin: 0; }
+  .wp { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: .5rem; align-items: end; margin-bottom: .5rem; }
+  .days { display: flex; flex-wrap: wrap; gap: .75rem; }
+  .days label { display: flex; gap: .3rem; align-items: center; margin: 0; }
+  .days input { width: auto; }
+  #banner { padding: .6rem .8rem; border-radius: 6px; margin-bottom: var(--gap); display: none; }
+  .warn { background: #b4530022; border: 1px solid #b45300; }
+  .err { background: #c0202022; border: 1px solid #c02020; }
+  .ok { background: #1a7f3722; border: 1px solid #1a7f37; }
+  #status { font-size: .85rem; opacity: .8; }
+  #preview { border: 1px solid var(--edge); image-rendering: pixelated; width: 256px; height: 64px; background: #000; }
+  .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: var(--gap); }
+  .danger { color: #c02020; }
+  option:disabled { opacity: .5; }
+</style>
+</head>
+<body>
+<h1>Traffic Monitor</h1>
+<div id="status">connecting…</div>
+<div id="banner"></div>
+
+<fieldset id="auth">
+  <label>Access token <span>Stored for this browser session only.</span>
+    <input type="password" id="token" autocomplete="current-password"></label>
+  <button id="unlock">Unlock</button>
+</fieldset>
+
+<form id="form" hidden>
+  <h2>Route</h2>
+  <fieldset>
+    <div class="row">
+      <label>Origin latitude<input type="number" step="any" id="olat" required></label>
+      <label>Origin longitude<input type="number" step="any" id="olng" required></label>
+    </div>
+    <div class="row">
+      <label>Destination latitude<input type="number" step="any" id="dlat" required></label>
+      <label>Destination longitude<input type="number" step="any" id="dlng" required></label>
+    </div>
+    <h2>Intermediates</h2>
+    <div id="waypoints"></div>
+    <button type="button" id="addwp">Add waypoint</button>
+    <label style="margin-top:.75rem">Paste coordinates <span>"53.4741, -2.2631" fills the next empty pair.</span>
+      <input type="text" id="paste" placeholder="lat, lng"></label>
+  </fieldset>
+
+  <h2>Schedule</h2>
+  <fieldset>
+    <div class="row">
+      <label>Start<input type="time" id="start" required></label>
+      <label>End<input type="time" id="end" required></label>
+    </div>
+    <label>Timezone<input type="text" id="tz" required></label>
+    <label>Active days</label>
+    <div class="days" id="days"></div>
+  </fieldset>
+
+  <h2>Tuning</h2>
+  <fieldset>
+    <div class="row">
+      <label>Poll interval (min)<input type="number" id="poll" min="1" max="60" step="any" required></label>
+      <label>ETA offset (min)<input type="number" id="offset" min="0" max="120" step="any" required></label>
+    </div>
+  </fieldset>
+
+  <h2>Route options</h2>
+  <fieldset>
+    <label class="days"><input type="checkbox" id="tolls"> Avoid tolls</label>
+    <div class="row">
+      <label>Language<select id="lang">
+        <option>en-GB</option><option>en-US</option><option>fr-FR</option><option>de-DE</option><option>es-ES</option>
+      </select></label>
+      <label>Units<select id="units"><option>IMPERIAL</option><option>METRIC</option></select></label>
+    </div>
+  </fieldset>
+
+  <h2>Display</h2>
+  <fieldset>
+    <label>Font<select id="font"></select></label>
+    <label id="sizewrap">Font size<input type="number" id="size" min="6" max="24"></label>
+    <div id="fontnote" style="font-size:.8rem;opacity:.7"></div>
+    <canvas id="preview" width="128" height="32"></canvas>
+  </fieldset>
+
+  <div class="actions">
+    <button type="submit">Save</button>
+    <button type="button" id="test">Test route</button>
+    <button type="button" id="reset" class="danger">Reset to fleet defaults</button>
+  </div>
+</form>
+
+<script>
+const $ = id => document.getElementById(id);
+let TOKEN = sessionStorage.getItem("tm-token") || "";
+let FONTS = [];
+
+const banner = (msg, kind = "warn") => {
+  const b = $("banner");
+  b.textContent = msg; b.className = kind; b.style.display = msg ? "block" : "none";
+};
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { "Content-Type": "application/json", "X-Auth-Token": TOKEN, ...(opts.headers || {}) },
+  });
+  const body = await res.text();
+  let data = null;
+  try { data = JSON.parse(body); } catch { /* plain-text error */ }
+  if (!res.ok) throw new Error(data?.field ? `${data.field}: ${data.error}` : body || res.statusText);
+  return data;
+}
+
+function waypointRow(lat = "", lng = "", via = true) {
+  const div = document.createElement("div");
+  div.className = "wp";
+  div.innerHTML = `<label>Lat<input type="number" step="any" class="wlat"></label>
+    <label>Lng<input type="number" step="any" class="wlng"></label>
+    <label style="display:flex;gap:.3rem;align-items:center"><input type="checkbox" class="wvia" style="width:auto"> via</label>
+    <button type="button" class="del">Remove</button>`;
+  div.querySelector(".wlat").value = lat;
+  div.querySelector(".wlng").value = lng;
+  div.querySelector(".wvia").checked = via;
+  div.querySelector(".del").onclick = () => div.remove();
+  return div;
+}
+
+function fillForm(cfg) {
+  const r = cfg.route;
+  if (r) {
+    $("olat").value = r.origin.latitude; $("olng").value = r.origin.longitude;
+    $("dlat").value = r.destination.latitude; $("dlng").value = r.destination.longitude;
+    $("waypoints").replaceChildren(...r.intermediates.map(w => waypointRow(w.location.latitude, w.location.longitude, w.via)));
+  }
+  $("start").value = cfg.schedule.start; $("end").value = cfg.schedule.end;
+  $("tz").value = cfg.timezone;
+  $("poll").value = cfg.poll_interval_minutes; $("offset").value = cfg.eta_offset_minutes;
+  $("tolls").checked = cfg.route_modifiers.avoid_tolls;
+  $("lang").value = cfg.language_code; $("units").value = cfg.units;
+  $("font").value = cfg.display.font; $("size").value = cfg.display.font_size;
+  document.querySelectorAll(".day").forEach(c => { c.checked = cfg.schedule.weekdays.includes(+c.value); });
+  onFontChange();
+}
+
+function collect() {
+  const num = id => parseFloat($(id).value);
+  return {
+    timezone: $("tz").value.trim(),
+    schedule: {
+      start: $("start").value, end: $("end").value,
+      weekdays: [...document.querySelectorAll(".day:checked")].map(c => +c.value),
+    },
+    poll_interval_minutes: num("poll"),
+    eta_offset_minutes: num("offset"),
+    route: {
+      origin: { latitude: num("olat"), longitude: num("olng") },
+      destination: { latitude: num("dlat"), longitude: num("dlng") },
+      intermediates: [...document.querySelectorAll(".wp")].map(w => ({
+        via: w.querySelector(".wvia").checked,
+        location: {
+          latitude: parseFloat(w.querySelector(".wlat").value),
+          longitude: parseFloat(w.querySelector(".wlng").value),
+        },
+      })),
+    },
+    route_modifiers: { avoid_tolls: $("tolls").checked },
+    language_code: $("lang").value,
+    units: $("units").value,
+    display: { font: $("font").value, font_size: +$("size").value },
+  };
+}
+
+function onFontChange() {
+  const f = FONTS.find(x => x.name === $("font").value);
+  if (!f) return;
+  $("sizewrap").hidden = f.kind !== "ttf";
+  $("fontnote").textContent = [
+    `${f.width}x${f.height} cell, ~${f.max_chars} chars per line`,
+    f.uppercase_only ? "renders uppercase only" : "",
+    f.fits ? "" : f.reason,
+  ].filter(Boolean).join(" — ");
+  drawPreview(f);
+}
+
+function drawPreview(f) {
+  const c = $("preview").getContext("2d");
+  c.fillStyle = "#000"; c.fillRect(0, 0, 128, 32);
+  c.fillStyle = "#cfe";
+  const size = f.kind === "ttf" ? +$("size").value : f.height;
+  c.font = `${size}px monospace`;
+  c.textBaseline = "top";
+  const step = Math.min(f.height + 2, 32 / 3);
+  const lines = ["ETA:         08:42", "Travel time: 34 min", "Traffic:     Normal"];
+  lines.forEach((t, i) => c.fillText(f.uppercase_only ? t.toUpperCase() : t, 0, i * step));
+}
+
+async function refreshStatus() {
+  try {
+    const s = await api("/api/status");
+    $("status").textContent =
+      `${s.hostname} — ${s.is_running ? "running" : "stopped"}` +
+      (s.next_iteration ? `, next poll ${new Date(s.next_iteration).toLocaleTimeString()}` : "") +
+      (s.last_error ? ` — last error: ${s.last_error}` : "");
+    if (s.degraded) banner(`Config degraded: ${s.degraded}`, "err");
+    else if (!s.configured) banner("No route configured yet.", "warn");
+  } catch (e) { $("status").textContent = `status unavailable: ${e.message}`; }
+}
+
+async function boot() {
+  const [{ config: cfg }, { fonts }] = await Promise.all([api("/api/config"), api("/api/fonts")]);
+  FONTS = fonts;
+  $("font").replaceChildren(...fonts.map(f => {
+    const o = document.createElement("option");
+    o.value = f.name;
+    o.textContent = f.fits ? f.name : `${f.name} — ${f.reason}`;
+    o.disabled = !f.fits;
+    return o;
+  }));
+  $("days").replaceChildren(...["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d, i) => {
+    const l = document.createElement("label");
+    l.innerHTML = `<input type="checkbox" class="day" value="${i}">${d}`;
+    return l;
+  }));
+  fillForm(cfg);
+  $("auth").hidden = true;
+  $("form").hidden = false;
+  refreshStatus();
+  setInterval(refreshStatus, 15000);
+}
+
+$("unlock").onclick = async () => {
+  TOKEN = $("token").value.trim();
+  try { await boot(); sessionStorage.setItem("tm-token", TOKEN); banner(""); }
+  catch (e) { banner(`Unlock failed: ${e.message}`, "err"); }
+};
+
+$("addwp").onclick = () => $("waypoints").append(waypointRow());
+$("font").onchange = onFontChange;
+$("size").oninput = onFontChange;
+
+$("paste").oninput = e => {
+  const m = e.target.value.match(/(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)/);
+  if (!m) return;
+  const targets = [["olat", "olng"], ["dlat", "dlng"]].find(([a]) => !$(a).value);
+  if (targets) { $(targets[0]).value = m[1]; $(targets[1]).value = m[2]; e.target.value = ""; }
+};
+
+$("form").onsubmit = async ev => {
+  ev.preventDefault();
+  try { await api("/api/config", { method: "PUT", body: JSON.stringify(collect()) }); banner("Saved.", "ok"); refreshStatus(); }
+  catch (e) { banner(e.message, "err"); }
+};
+
+$("test").onclick = async () => {
+  banner("Testing…");
+  try {
+    const r = await api("/api/route/test", { method: "POST" });
+    banner(`Route OK — ${r.duration}, ${r.distanceMeters} m`, "ok");
+  } catch (e) { banner(`Test failed: ${e.message}`, "err"); }
+};
+
+$("reset").onclick = async () => {
+  if (!confirm("Discard this device's local settings and return to fleet defaults?")) return;
+  try { const r = await api("/api/config/reset", { method: "POST" }); fillForm(r.config); banner("Reset to fleet defaults.", "ok"); }
+  catch (e) { banner(e.message, "err"); }
+};
+
+if (TOKEN) boot().catch(() => banner("Stored token rejected, re-enter it.", "err"));
+</script>
+</body>
+</html>
