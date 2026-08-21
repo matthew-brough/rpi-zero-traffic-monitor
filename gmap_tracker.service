@@ -1,0 +1,19 @@
+[Unit]
+Description=Google Maps Traffic Tracker
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/dev/i2c-1
+
+[Service]
+Type=simple
+User=artem_op
+WorkingDirectory=/home/artem_op/projects/rpi-zero-traffic-monitor
+ExecStart=/home/artem_op/projects/rpi-zero-traffic-monitor/venv/bin/python -m gmap_tracker
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
