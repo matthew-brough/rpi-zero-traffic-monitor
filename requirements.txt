@@ -1,2 +1,2 @@
 aiohttp[speedups]==3.13.3
-adafruit_ssd1305[gpio] @ git+ssh://git@github.com/matthew-brough/adafruit_ssd1305.git
+adafruit_ssd1305[gpio] @ git+https://github.com/matthew-brough/adafruit_ssd1305.git
